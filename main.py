@@ -86,15 +86,11 @@ def main():
     log.info("\n[2/8] Building training DataFrame...")
     from feature_engineering import build_training_dataframe
     training_path = os.path.join(PROCESSED_DIR, "training_data.csv")
-    if os.path.exists(training_path):
-        log.info(f"  Loading cached training data from {training_path}")
-        training_df = pd.read_csv(training_path)
-    else:
-        training_df = build_training_dataframe(
-            seasons=SEASONS,
-            data_dir=DATA_DIR,
-            output_path=training_path,
-        )
+    training_df = build_training_dataframe(
+        seasons=SEASONS,
+        data_dir=DATA_DIR,
+        output_path=training_path,
+    )
     log.info(f"  Training data: {len(training_df)} rows, win rate={training_df['won'].mean():.3f}")
 
     # ── Step 3: Train model + cross-validation ────────────────────────────────

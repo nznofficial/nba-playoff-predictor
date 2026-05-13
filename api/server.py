@@ -24,6 +24,7 @@ from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from model import MODEL_FEATURES
+from feature_engineering import compute_playoff_experience
 
 log = logging.getLogger("uvicorn.error")
 
@@ -35,6 +36,19 @@ CACHE_TTL   = 3600
 
 CURRENT_SEASON         = "2025-26"
 HOME_GAMES_HIGHER_SEED = {1, 2, 5, 7}
+
+ALL_SEASONS = [
+    "2015-16", "2016-17", "2017-18", "2018-19",
+    "2019-20", "2020-21", "2021-22", "2022-23", "2023-24", "2024-25", "2025-26",
+]
+
+# Abbreviation lookup for ESPN injury API mapping
+_TEAM_ABBR: dict[int, str] = {
+    1610612760: "OKC", 1610612759: "SAS", 1610612743: "DEN", 1610612747: "LAL",
+    1610612745: "HOU", 1610612750: "MIN", 1610612756: "PHX", 1610612757: "POR",
+    1610612765: "DET", 1610612752: "NYK", 1610612739: "CLE", 1610612738: "BOS",
+    1610612755: "PHI", 1610612737: "ATL", 1610612753: "ORL", 1610612761: "TOR",
+}
 
 _model = joblib.load(MODEL_PATH)
 
@@ -217,6 +231,94 @@ def _get_last_game_dates() -> dict:
         return {}
 
 
+def _compute_series_momentum(team_a_id: int, team_b_id: int) -> tuple:
+    """
+    Returns (series_pts_diff_a, series_pts_diff_b) from the live game cache.
+    Each value is that team's average PLUS_MINUS in previous games of this series.
+    """
+    if not CACHE_FILE.exists():
+        return 0.0, 0.0
+    try:
+        with open(CACHE_FILE) as f:
+            cached = json.load(f)
+        games = cached.get("games", [])
+        if not games:
+            return 0.0, 0.0
+
+        from collections import defaultdict
+        game_teams: dict = defaultdict(set)
+        game_pm: dict = {}
+        for row in games:
+            gid = str(row["GAME_ID"])
+            tid = int(row["TEAM_ID"])
+            game_teams[gid].add(tid)
+            game_pm[(tid, gid)] = float(row.get("PLUS_MINUS", 0))
+
+        series_gids = sorted(
+            gid for gid, teams in game_teams.items()
+            if team_a_id in teams and team_b_id in teams
+        )
+        if not series_gids:
+            return 0.0, 0.0
+
+        pm_a = [game_pm.get((team_a_id, gid), 0.0) for gid in series_gids]
+        pm_b = [game_pm.get((team_b_id, gid), 0.0) for gid in series_gids]
+        return float(np.mean(pm_a)), float(np.mean(pm_b))
+    except Exception as e:
+        log.warning(f"Series momentum failed: {e}")
+        return 0.0, 0.0
+
+
+def _compute_prior_playoff_pts(team_id: int) -> float:
+    """Average PLUS_MINUS for a team across all their games in the current playoffs."""
+    if not CACHE_FILE.exists():
+        return 0.0
+    try:
+        with open(CACHE_FILE) as f:
+            cached = json.load(f)
+        values = [
+            float(g.get("PLUS_MINUS", 0))
+            for g in cached.get("games", [])
+            if int(g["TEAM_ID"]) == team_id
+        ]
+        return float(np.mean(values)) if values else 0.0
+    except Exception:
+        return 0.0
+
+
+def _fetch_injury_burden(abbr: str) -> float:
+    """
+    Returns a [0, 1] injury burden for a team via the ESPN public injury API.
+    Higher = more key players out. Gracefully returns 0.0 on any failure.
+    """
+    if not abbr:
+        return 0.0
+    try:
+        import urllib.request
+        url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            data = json.loads(r.read())
+
+        burden = 0.0
+        for team_entry in data.get("injuries", []):
+            if team_entry.get("team", {}).get("abbreviation", "").upper() == abbr.upper():
+                for item in team_entry.get("items", []):
+                    status = item.get("status", "").lower()
+                    if "out" in status:
+                        burden += 1.0
+                    elif "doubtful" in status:
+                        burden += 0.75
+                    elif "questionable" in status:
+                        burden += 0.25
+                break
+
+        return min(burden / 5.0, 1.0)  # cap at 5-player equivalent
+    except Exception as e:
+        log.warning(f"Injury fetch failed ({abbr}): {e}")
+        return 0.0
+
+
 def _live_key(id_a: int, id_b: int) -> str:
     return f"{min(id_a, id_b)}_{max(id_a, id_b)}"
 
@@ -369,42 +471,64 @@ def predict_game(req: PredictRequest):
     higher_id = req.team_a_id if req.seed_a < req.seed_b else req.team_b_id
     home_a = (higher_id == req.team_a_id) == (game_num in HOME_GAMES_HIGHER_SEED)
 
+    # ── Rest days (from live game cache) ──────────────────────────────────────
     today = pd.Timestamp.today().normalize()
     last_dates = _get_last_game_dates()
     date_a = last_dates.get(req.team_a_id)
     date_b = last_dates.get(req.team_b_id)
     rest_days_diff = int((today - date_a).days - (today - date_b).days) if date_a and date_b else 0
 
+    # ── Playoff experience (prior 3 seasons) ──────────────────────────────────
+    exp_a = compute_playoff_experience(req.team_a_id, CURRENT_SEASON, ALL_SEASONS, str(DATA_DIR))
+    exp_b = compute_playoff_experience(req.team_b_id, CURRENT_SEASON, ALL_SEASONS, str(DATA_DIR))
+
+    # ── In-series & season momentum (from live game cache) ───────────────────
+    series_pm_a, series_pm_b = _compute_series_momentum(req.team_a_id, req.team_b_id)
+    prior_pm_a = _compute_prior_playoff_pts(req.team_a_id)
+    prior_pm_b = _compute_prior_playoff_pts(req.team_b_id)
+
     def g(s, col, d=0.0):
         return float(s[col]) if col in s.index and not pd.isna(s[col]) else d
 
     features = {
-        "net_rtg_diff":       g(sa, "NET_RATING")    - g(sb, "NET_RATING"),
-        "off_rtg_diff":       g(sa, "OFF_RATING")    - g(sb, "DEF_RATING"),
-        "def_rtg_diff":       g(sa, "DEF_RATING")    - g(sb, "OFF_RATING"),
-        "pace_diff":          g(sa, "PACE")           - g(sb, "PACE"),
-        "rest_days_diff":     rest_days_diff,
-        "home_court":         int(home_a),
-        "win_pct_diff":       g(sa, "W_PCT")          - g(sb, "W_PCT"),
-        "series_game_num":    game_num,
-        "series_lead":        req.wins_a - req.wins_b,
-        "three_pt_rate_diff": g(sa, "three_pt_rate", .35) - g(sb, "three_pt_rate", .35),
-        "playoff_exp_diff":   0.0,
-        "is_bubble":          0,
+        "net_rtg_diff":            g(sa, "NET_RATING")  - g(sb, "NET_RATING"),
+        "off_rtg_diff":            g(sa, "OFF_RATING")  - g(sb, "DEF_RATING"),
+        "def_rtg_diff":            g(sa, "DEF_RATING")  - g(sb, "OFF_RATING"),
+        "pace_diff":               g(sa, "PACE")         - g(sb, "PACE"),
+        "rest_days_diff":          rest_days_diff,
+        "home_court":              int(home_a),
+        "win_pct_diff":            g(sa, "W_PCT")        - g(sb, "W_PCT"),
+        "series_game_num":         game_num,
+        "series_lead":             req.wins_a - req.wins_b,
+        "three_pt_rate_diff":      g(sa, "three_pt_rate", .35) - g(sb, "three_pt_rate", .35),
+        "playoff_exp_diff":        float(exp_a - exp_b),
+        "is_bubble":               0,
+        "series_pts_diff":         round(series_pm_a - series_pm_b, 2),
+        "prior_playoff_pts_diff":  round(prior_pm_a  - prior_pm_b,  2),
     }
 
     prob_a = float(_model.predict_proba(pd.DataFrame([features])[MODEL_FEATURES])[0, 1])
+
+    # ── Injury adjustment (post-model, ESPN API) ──────────────────────────────
+    abbr_a = _TEAM_ABBR.get(req.team_a_id, "")
+    abbr_b = _TEAM_ABBR.get(req.team_b_id, "")
+    inj_a  = _fetch_injury_burden(abbr_a)
+    inj_b  = _fetch_injury_burden(abbr_b)
+    INJURY_SCALE = 0.12
+    prob_a = float(np.clip(prob_a + (inj_b - inj_a) * INJURY_SCALE, 0.05, 0.95))
+    prob_b = 1.0 - prob_a
+
     winner_id = req.team_a_id if prob_a >= 0.5 else req.team_b_id
     home_team = _name(req.team_a_id) if home_a else _name(req.team_b_id)
 
     return PredictResponse(
-        team_a_id=req.team_a_id,   team_b_id=req.team_b_id,
+        team_a_id=req.team_a_id,        team_b_id=req.team_b_id,
         team_a_name=_name(req.team_a_id), team_b_name=_name(req.team_b_id),
-        prob_a=round(prob_a, 4),   prob_b=round(1 - prob_a, 4),
+        prob_a=round(prob_a, 4),         prob_b=round(prob_b, 4),
         predicted_winner_id=winner_id,
         predicted_winner_name=_name(winner_id),
-        game_num=game_num,         home_team=home_team,
-        features=features,
+        game_num=game_num,               home_team=home_team,
+        features={**features, "injury_burden_a": round(inj_a, 3), "injury_burden_b": round(inj_b, 3)},
     )
 
 

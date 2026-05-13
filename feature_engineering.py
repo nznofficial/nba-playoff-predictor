@@ -2,9 +2,9 @@
 feature_engineering.py — Build model-ready training and prediction DataFrames.
 
 Each playoff game produces two rows (one per team perspective) with differential
-features derived from regular-season stats. Playoff series structure and rest days
-are derived from pre-fetched playoff_games CSV files (LeagueGameFinder format).
-No additional API calls are needed.
+features derived from regular-season stats. Playoff series structure, rest days,
+and in-series / season momentum are derived from pre-fetched playoff_games CSV
+files (LeagueGameFinder format). No additional API calls are needed.
 """
 
 import os
@@ -19,15 +19,21 @@ BUBBLE_SEASON = "2019-20"
 REST_CAP = 10
 REST_DEFAULT = 5
 
-# Seasons with available playoff game CSVs (LeagueGameFinder data)
 TRAINING_SEASONS = [
     "2015-16", "2016-17", "2017-18", "2018-19",
     "2019-20", "2020-21", "2021-22", "2022-23", "2023-24",
 ]
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-PLAYOFF_DATA_DIR = os.path.normpath(
-    os.path.join(_THIS_DIR, "..", "emv_proj1_Playoff_Predictor", "data", "raw")
+
+# Use local data/raw/ first (works on Render); fall back to sibling emv project for dev
+_LOCAL_DIR = os.path.join(_THIS_DIR, "data", "raw")
+_EMV_DIR   = os.path.normpath(os.path.join(_THIS_DIR, "..", "emv_proj1_Playoff_Predictor", "data", "raw"))
+
+PLAYOFF_DATA_DIR = (
+    _LOCAL_DIR
+    if os.path.exists(os.path.join(_LOCAL_DIR, "playoff_games_2023-24.csv"))
+    else _EMV_DIR
 )
 
 
@@ -44,6 +50,43 @@ def _load_playoff_games(season: str, playoff_dir: str = None) -> pd.DataFrame:
     return df
 
 
+def _add_momentum_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add two momentum features to a game-level DataFrame (one row per team per game):
+
+    series_pts_diff      — focal team's avg PLUS_MINUS in PREVIOUS games of this
+                           specific series. Captures within-series momentum.
+                           0 for game 1 of any series.
+
+    prior_playoff_pts_diff — focal team's avg PLUS_MINUS in ALL previous playoff
+                             games this season (across any series). Captures overall
+                             playoff form coming into the current game. 0 for the
+                             team's very first playoff game of the season.
+    """
+    if "plus_minus" not in df.columns:
+        df["series_pts_diff"] = 0.0
+        df["prior_playoff_pts_diff"] = 0.0
+        return df
+
+    df = df.sort_values(["game_date", "game_id"]).copy()
+
+    # series_pts_diff: expanding mean of PREVIOUS games in same (team, series) group
+    df["series_pts_diff"] = (
+        df.groupby(["team_id", "series_id"])["plus_minus"]
+        .transform(lambda x: x.shift(1).expanding().mean())
+        .fillna(0.0)
+    )
+
+    # prior_playoff_pts_diff: expanding mean of ALL PREVIOUS playoff games this season
+    df["prior_playoff_pts_diff"] = (
+        df.groupby("team_id")["plus_minus"]
+        .transform(lambda x: x.shift(1).expanding().mean())
+        .fillna(0.0)
+    )
+
+    return df
+
+
 def build_series_records(
     season: str,
     data_dir: str = "data/raw",
@@ -51,14 +94,14 @@ def build_series_records(
 ) -> pd.DataFrame:
     """
     Reconstruct playoff series from a LeagueGameFinder-format playoff games CSV.
-    Returns DataFrame with one row per (team, game): team_id, opponent_id, series
-    metadata, home_court, won, rest_days, series tracking columns.
+    Returns DataFrame with one row per (team, game) including rest days,
+    series context, and momentum features (series_pts_diff, prior_playoff_pts_diff).
     """
     pg = _load_playoff_games(season, playoff_dir)
     if len(pg) == 0:
         return pd.DataFrame()
 
-    # Rest days per team: days since their previous game in this playoff run
+    # Rest days per team
     pg_sorted = pg.sort_values(["TEAM_ID", "GAME_DATE"]).copy()
     pg_sorted["rest_days"] = (
         pg_sorted.groupby("TEAM_ID")["GAME_DATE"]
@@ -72,7 +115,13 @@ def build_series_records(
         for _, row in pg_sorted.iterrows()
     }
 
-    # Build per-game records keyed by GAME_ID
+    # PLUS_MINUS lookup for momentum features
+    pm_lookup = {}
+    if "PLUS_MINUS" in pg.columns:
+        for _, row in pg.iterrows():
+            pm_lookup[(int(row["TEAM_ID"]), str(row["GAME_ID"]))] = float(row.get("PLUS_MINUS", 0))
+
+    # Build per-game records
     game_records = {}
     for _, row in pg.iterrows():
         gid = str(row["GAME_ID"])
@@ -84,7 +133,7 @@ def build_series_records(
             "MATCHUP": str(row.get("MATCHUP", "")),
         })
 
-    # Group games into series by opposing team pair
+    # Group games into series by team pair
     series_games: dict = {}
     for gid, info in game_records.items():
         team_ids = [t["TEAM_ID"] for t in info["teams"]]
@@ -118,25 +167,25 @@ def build_series_records(
                 series_losses = wins_b if focal_id == team_a else wins_a
 
                 all_rows.append({
-                    "season": season,
-                    "game_date": gdate,
-                    "team_id": focal_id,
-                    "opponent_id": opp_id,
-                    "game_id": gid,
-                    "series_id": series_id,
+                    "season":          season,
+                    "game_date":       gdate,
+                    "team_id":         focal_id,
+                    "opponent_id":     opp_id,
+                    "game_id":         gid,
+                    "series_id":       series_id,
                     "series_game_num": game_num,
-                    "home_court": home_court,
-                    "won": won,
-                    "rest_days": rest,
-                    "opp_rest_days": opp_rest,
-                    "rest_days_diff": rest - opp_rest,
-                    "series_wins": series_wins,
-                    "series_losses": series_losses,
-                    "series_lead": series_wins - series_losses,
-                    "is_bubble": 1 if season == BUBBLE_SEASON else 0,
+                    "home_court":      home_court,
+                    "won":             won,
+                    "rest_days":       rest,
+                    "opp_rest_days":   opp_rest,
+                    "rest_days_diff":  rest - opp_rest,
+                    "series_wins":     series_wins,
+                    "series_losses":   series_losses,
+                    "series_lead":     series_wins - series_losses,
+                    "is_bubble":       1 if season == BUBBLE_SEASON else 0,
+                    "plus_minus":      pm_lookup.get((focal_id, gid), 0.0),
                 })
 
-            # Update series score after each game
             for t in game_records[gid]["teams"]:
                 if t["WL"] == "W":
                     if t["TEAM_ID"] == team_a:
@@ -144,7 +193,12 @@ def build_series_records(
                     else:
                         wins_b += 1
 
-    return pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
+    if not all_rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows)
+    df = _add_momentum_features(df)
+    return df
 
 
 def compute_playoff_experience(
@@ -170,13 +224,13 @@ def compute_playoff_experience(
 
 def _load_reg_season_stats(season: str, data_dir: str) -> pd.DataFrame:
     """Load and merge regular-season advanced + basic stats for a season."""
-    adv_path = os.path.join(data_dir, "team_stats", f"{season}_Regular_Season_advanced.csv")
+    adv_path  = os.path.join(data_dir, "team_stats", f"{season}_Regular_Season_advanced.csv")
     base_path = os.path.join(data_dir, "team_stats", f"{season}_Regular_Season_base.csv")
 
     if not os.path.exists(adv_path) or not os.path.exists(base_path):
         return pd.DataFrame()
 
-    adv = pd.read_csv(adv_path)
+    adv  = pd.read_csv(adv_path)
     base = pd.read_csv(base_path)
 
     if "FG3A" in base.columns and "FGA" in base.columns:
@@ -184,14 +238,13 @@ def _load_reg_season_stats(season: str, data_dir: str) -> pd.DataFrame:
     else:
         base["three_pt_rate"] = 0.35
 
-    base_slim = base[["TEAM_ID", "three_pt_rate"]].copy()
-    merged = adv.merge(base_slim, on="TEAM_ID", how="left")
+    merged = adv.merge(base[["TEAM_ID", "three_pt_rate"]], on="TEAM_ID", how="left")
     merged["three_pt_rate"] = merged["three_pt_rate"].fillna(0.35)
     return merged
 
 
 def _build_diff_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute all differential columns from joined focal + opponent stats."""
+    """Compute differential columns from joined focal + opponent stats."""
     df = df.copy()
 
     def _diff(focal_col, opp_col, default=0.0):
@@ -199,13 +252,13 @@ def _build_diff_features(df: pd.DataFrame) -> pd.DataFrame:
         b = df[opp_col].fillna(default) if opp_col in df.columns else default
         return a - b
 
-    df["off_rtg_diff"] = _diff("off_rtg", "opp_def_rtg")
-    df["def_rtg_diff"] = _diff("def_rtg", "opp_off_rtg")
-    df["net_rtg_diff"] = _diff("net_rtg", "opp_net_rtg")
-    df["pace_diff"] = _diff("pace", "opp_pace")
-    df["win_pct_diff"] = _diff("team_win_pct_reg", "opp_team_win_pct_reg")
-    df["three_pt_rate_diff"] = _diff("three_pt_rate", "opp_three_pt_rate", 0.35)
-    df["playoff_exp_diff"] = _diff("playoff_exp_3yr", "opp_playoff_exp_3yr")
+    df["off_rtg_diff"]      = _diff("off_rtg",          "opp_def_rtg")
+    df["def_rtg_diff"]      = _diff("def_rtg",          "opp_off_rtg")
+    df["net_rtg_diff"]      = _diff("net_rtg",          "opp_net_rtg")
+    df["pace_diff"]         = _diff("pace",              "opp_pace")
+    df["win_pct_diff"]      = _diff("team_win_pct_reg",  "opp_team_win_pct_reg")
+    df["three_pt_rate_diff"]= _diff("three_pt_rate",     "opp_three_pt_rate", 0.35)
+    df["playoff_exp_diff"]  = _diff("playoff_exp_3yr",   "opp_playoff_exp_3yr")
     return df
 
 
@@ -225,13 +278,12 @@ def merge_team_stats_onto_games(
         "OFF_RATING": "off_rtg",
         "DEF_RATING": "def_rtg",
         "NET_RATING": "net_rtg",
-        "PACE": "pace",
-        "W_PCT": "team_win_pct_reg",
+        "PACE":       "pace",
+        "W_PCT":      "team_win_pct_reg",
     })
     if "net_rtg" not in stats.columns and "off_rtg" in stats.columns:
         stats["net_rtg"] = stats["off_rtg"] - stats["def_rtg"]
 
-    # Playoff experience for every team seen in this season's games
     all_team_ids = pd.concat([games_df["team_id"], games_df["opponent_id"]]).unique()
     exp_map = {
         int(tid): compute_playoff_experience(int(tid), season, all_seasons, playoff_dir)
@@ -245,13 +297,13 @@ def merge_team_stats_onto_games(
     ] if c in stats.columns]
 
     stats_focal = stats[stat_cols].rename(columns={"TEAM_ID": "team_id"})
-    stats_opp = stats_focal.rename(columns={
+    stats_opp   = stats_focal.rename(columns={
         "team_id": "opponent_id",
         **{c: f"opp_{c}" for c in stats_focal.columns if c != "team_id"},
     })
 
-    df = games_df.merge(stats_focal, on="team_id", how="left")
-    df = df.merge(stats_opp, on="opponent_id", how="left")
+    df = games_df.merge(stats_focal, on="team_id",   how="left")
+    df = df.merge(stats_opp,         on="opponent_id", how="left")
     return _build_diff_features(df)
 
 
@@ -263,12 +315,10 @@ def build_training_dataframe(
 ) -> pd.DataFrame:
     """
     Build complete training DataFrame from all cached season data.
-    Uses playoff_games CSV files for series reconstruction and advanced stats
-    CSVs for team ratings. Saves to output_path and returns the DataFrame.
+    Saves to output_path and returns the DataFrame.
     """
     if seasons is None:
         seasons = TRAINING_SEASONS
-    # Only use seasons that have playoff game files
     seasons = [s for s in seasons if s in TRAINING_SEASONS]
 
     Path(os.path.dirname(output_path)).mkdir(parents=True, exist_ok=True)
@@ -315,10 +365,7 @@ def build_current_season_features(
     all_seasons: list = None,
     playoff_dir: str = None,
 ) -> pd.DataFrame:
-    """
-    Build feature rows for all first-round playoff matchups of the current season.
-    playoff_seedings: {"West": [(seed, team_id), ...], "East": [...]}
-    """
+    """Build feature rows for first-round playoff matchups of the current season."""
     if all_seasons is None:
         all_seasons = TRAINING_SEASONS + [season]
     if playoff_dir is None:
@@ -342,7 +389,7 @@ def build_current_season_features(
         for higher_seed, lower_seed in [(1, 8), (2, 7), (3, 6), (4, 5)]:
             if higher_seed not in seed_map or lower_seed not in seed_map:
                 continue
-            team_a = seed_map[higher_seed]  # higher seed has home court
+            team_a = seed_map[higher_seed]
             team_b = seed_map[lower_seed]
 
             for focal_id, opp_id, home_court, focal_seed, opp_seed in [
@@ -350,27 +397,29 @@ def build_current_season_features(
                 (team_b, team_a, 0, lower_seed, higher_seed),
             ]:
                 exp_focal = compute_playoff_experience(focal_id, season, all_seasons, playoff_dir)
-                exp_opp = compute_playoff_experience(opp_id, season, all_seasons, playoff_dir)
+                exp_opp   = compute_playoff_experience(opp_id,   season, all_seasons, playoff_dir)
                 rows.append({
-                    "season": season,
-                    "conference": conf,
-                    "team_id": focal_id,
-                    "opponent_id": opp_id,
-                    "team_seed": focal_seed,
-                    "opp_seed": opp_seed,
-                    "series_id": f"{season}_{conf}_{higher_seed}v{lower_seed}",
-                    "series_game_num": 1,
-                    "home_court": home_court,
-                    "rest_days": 10,
-                    "opp_rest_days": 10,
-                    "rest_days_diff": 0,
-                    "series_wins": 0,
-                    "series_losses": 0,
-                    "series_lead": 0,
-                    "is_bubble": 0,
-                    "playoff_exp_3yr": exp_focal,
-                    "opp_playoff_exp_3yr": exp_opp,
-                    "playoff_exp_diff": exp_focal - exp_opp,
+                    "season":                 season,
+                    "conference":             conf,
+                    "team_id":                focal_id,
+                    "opponent_id":            opp_id,
+                    "team_seed":              focal_seed,
+                    "opp_seed":               opp_seed,
+                    "series_id":              f"{season}_{conf}_{higher_seed}v{lower_seed}",
+                    "series_game_num":        1,
+                    "home_court":             home_court,
+                    "rest_days":              10,
+                    "opp_rest_days":          10,
+                    "rest_days_diff":         0,
+                    "series_wins":            0,
+                    "series_losses":          0,
+                    "series_lead":            0,
+                    "is_bubble":              0,
+                    "playoff_exp_3yr":        exp_focal,
+                    "opp_playoff_exp_3yr":    exp_opp,
+                    "playoff_exp_diff":       exp_focal - exp_opp,
+                    "series_pts_diff":        0.0,
+                    "prior_playoff_pts_diff": 0.0,
                 })
 
     current_df = pd.DataFrame(rows)
@@ -390,13 +439,13 @@ def build_current_season_features(
         "team_win_pct_reg", "three_pt_rate",
     ] if c in stats.columns]
     stats_slim = stats[stat_cols].rename(columns={"TEAM_ID": "team_id"})
-    stats_opp = stats_slim.rename(columns={
+    stats_opp  = stats_slim.rename(columns={
         "team_id": "opponent_id",
         **{c: f"opp_{c}" for c in stats_slim.columns if c != "team_id"},
     })
 
-    current_df = current_df.merge(stats_slim, on="team_id", how="left")
-    current_df = current_df.merge(stats_opp, on="opponent_id", how="left")
+    current_df = current_df.merge(stats_slim, on="team_id",   how="left")
+    current_df = current_df.merge(stats_opp,  on="opponent_id", how="left")
     current_df = _build_diff_features(current_df)
 
     current_df.to_csv(output_path, index=False)

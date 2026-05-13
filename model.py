@@ -35,6 +35,8 @@ MODEL_FEATURES = [
     "three_pt_rate_diff",
     "playoff_exp_diff",
     "is_bubble",
+    "series_pts_diff",
+    "prior_playoff_pts_diff",
 ]
 
 # Seasons used for temporal split
