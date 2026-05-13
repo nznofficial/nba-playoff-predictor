@@ -1,7 +1,7 @@
 services:
   - type: web
     name: nba-playoff-predictor
-    env: python
+    runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt && cd web && npm ci && npm run build
     startCommand: uvicorn api.server:app --host 0.0.0.0 --port $PORT
