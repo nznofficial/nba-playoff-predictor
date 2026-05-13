@@ -201,6 +201,22 @@ def _parse_series_scores(df: pd.DataFrame) -> dict:
     return series
 
 
+def _get_last_game_dates() -> dict:
+    """Returns {team_id: pd.Timestamp} of each team's most recent playoff game."""
+    if not CACHE_FILE.exists():
+        return {}
+    try:
+        with open(CACHE_FILE) as f:
+            cached = json.load(f)
+        df = pd.DataFrame(cached.get("games", []))
+        if len(df) == 0:
+            return {}
+        df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
+        return {int(tid): ts for tid, ts in df.groupby("TEAM_ID")["GAME_DATE"].max().items()}
+    except Exception:
+        return {}
+
+
 def _live_key(id_a: int, id_b: int) -> str:
     return f"{min(id_a, id_b)}_{max(id_a, id_b)}"
 
@@ -353,6 +369,12 @@ def predict_game(req: PredictRequest):
     higher_id = req.team_a_id if req.seed_a < req.seed_b else req.team_b_id
     home_a = (higher_id == req.team_a_id) == (game_num in HOME_GAMES_HIGHER_SEED)
 
+    today = pd.Timestamp.today().normalize()
+    last_dates = _get_last_game_dates()
+    date_a = last_dates.get(req.team_a_id)
+    date_b = last_dates.get(req.team_b_id)
+    rest_days_diff = int((today - date_a).days - (today - date_b).days) if date_a and date_b else 0
+
     def g(s, col, d=0.0):
         return float(s[col]) if col in s.index and not pd.isna(s[col]) else d
 
@@ -361,7 +383,7 @@ def predict_game(req: PredictRequest):
         "off_rtg_diff":       g(sa, "OFF_RATING")    - g(sb, "DEF_RATING"),
         "def_rtg_diff":       g(sa, "DEF_RATING")    - g(sb, "OFF_RATING"),
         "pace_diff":          g(sa, "PACE")           - g(sb, "PACE"),
-        "rest_days_diff":     0,
+        "rest_days_diff":     rest_days_diff,
         "home_court":         int(home_a),
         "win_pct_diff":       g(sa, "W_PCT")          - g(sb, "W_PCT"),
         "series_game_num":    game_num,
