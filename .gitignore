@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.env
+*.egg-info/
+
+# Logs
+*.log
+
+# Large raw data not needed by API
+data/raw/game_logs/
+data/cache/
+data/processed/
+
+# Output / visualizations
+output/
+
+# Node / React
+web/node_modules/
+web/dist/
+
+# OS
+.DS_Store
+.idea/
+.vscode/
+
+# Claude local settings
+.claude/
