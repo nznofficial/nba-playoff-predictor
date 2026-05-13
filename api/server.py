@@ -286,6 +286,47 @@ def _compute_prior_playoff_pts(team_id: int) -> float:
         return 0.0
 
 
+def _compute_playoff_team_ratings(team_id: int) -> dict | None:
+    """
+    Avg efficiency ratings from the team's playoff games this season.
+    Returns None if fewer than 4 games played (not enough data for R2+ override).
+    """
+    if not CACHE_FILE.exists():
+        return None
+    try:
+        with open(CACHE_FILE) as f:
+            cached = json.load(f)
+        team_games = [g for g in cached.get("games", []) if int(g["TEAM_ID"]) == team_id]
+        if len(team_games) < 4:
+            return None
+
+        off_rtgs, def_rtgs, paces = [], [], []
+        for g in team_games:
+            pts  = float(g.get("PTS",  0) or 0)
+            fga  = float(g.get("FGA",  0) or 0)
+            fta  = float(g.get("FTA",  0) or 0)
+            oreb = float(g.get("OREB", 0) or 0)
+            tov  = float(g.get("TOV",  0) or 0)
+            mins = float(g.get("MIN", 240) or 240)
+            pm   = float(g.get("PLUS_MINUS", 0) or 0)
+
+            poss    = max(fga - oreb + tov + 0.44 * fta, 1.0)
+            off_rtg = pts / poss * 100
+            def_rtg = (pts - pm) / poss * 100
+            pace    = poss * 240.0 / max(mins, 1.0)
+            off_rtgs.append(off_rtg)
+            def_rtgs.append(def_rtg)
+            paces.append(pace)
+
+        avg_off = float(np.mean(off_rtgs))
+        avg_def = float(np.mean(def_rtgs))
+        return {"off_rtg": avg_off, "def_rtg": avg_def,
+                "net_rtg": avg_off - avg_def, "pace": float(np.mean(paces))}
+    except Exception as e:
+        log.warning(f"Playoff ratings failed (team {team_id}): {e}")
+        return None
+
+
 def _fetch_injury_burden(abbr: str) -> float:
     """
     Returns a [0, 1] injury burden for a team via the ESPN public injury API.
@@ -487,14 +528,28 @@ def predict_game(req: PredictRequest):
     prior_pm_a = _compute_prior_playoff_pts(req.team_a_id)
     prior_pm_b = _compute_prior_playoff_pts(req.team_b_id)
 
+    # ── Playoff efficiency ratings (replace reg season for R2+ teams) ─────────
+    po_rtg_a = _compute_playoff_team_ratings(req.team_a_id)
+    po_rtg_b = _compute_playoff_team_ratings(req.team_b_id)
+
     def g(s, col, d=0.0):
         return float(s[col]) if col in s.index and not pd.isna(s[col]) else d
 
+    off_a = po_rtg_a["off_rtg"] if po_rtg_a else g(sa, "OFF_RATING")
+    def_a = po_rtg_a["def_rtg"] if po_rtg_a else g(sa, "DEF_RATING")
+    net_a = po_rtg_a["net_rtg"] if po_rtg_a else g(sa, "NET_RATING")
+    pac_a = po_rtg_a["pace"]    if po_rtg_a else g(sa, "PACE")
+
+    off_b = po_rtg_b["off_rtg"] if po_rtg_b else g(sb, "OFF_RATING")
+    def_b = po_rtg_b["def_rtg"] if po_rtg_b else g(sb, "DEF_RATING")
+    net_b = po_rtg_b["net_rtg"] if po_rtg_b else g(sb, "NET_RATING")
+    pac_b = po_rtg_b["pace"]    if po_rtg_b else g(sb, "PACE")
+
     features = {
-        "net_rtg_diff":            g(sa, "NET_RATING")  - g(sb, "NET_RATING"),
-        "off_rtg_diff":            g(sa, "OFF_RATING")  - g(sb, "DEF_RATING"),
-        "def_rtg_diff":            g(sa, "DEF_RATING")  - g(sb, "OFF_RATING"),
-        "pace_diff":               g(sa, "PACE")         - g(sb, "PACE"),
+        "net_rtg_diff":            net_a - net_b,
+        "off_rtg_diff":            off_a - def_b,
+        "def_rtg_diff":            def_a - off_b,
+        "pace_diff":               pac_a - pac_b,
         "rest_days_diff":          rest_days_diff,
         "home_court":              int(home_a),
         "win_pct_diff":            g(sa, "W_PCT")        - g(sb, "W_PCT"),

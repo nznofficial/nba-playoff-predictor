@@ -50,6 +50,51 @@ def _load_playoff_games(season: str, playoff_dir: str = None) -> pd.DataFrame:
     return df
 
 
+def _compute_playoff_team_stats(pg: pd.DataFrame) -> dict:
+    """
+    For each (team_id, game_id), compute avg playoff efficiency from all PRIOR games.
+    Returns {} if required columns are missing or no team has >= 4 prior games.
+    Only entries with prior_games_count >= 4 (completed at least one series) are stored.
+
+    Keys: (team_id: int, game_id: str)
+    Values: {playoff_off_rtg, playoff_def_rtg, playoff_net_rtg, playoff_pace, prior_games_count}
+    """
+    needed = {"TEAM_ID", "GAME_ID", "GAME_DATE", "PTS", "FGA", "FTA", "OREB", "TOV", "MIN", "PLUS_MINUS"}
+    if not needed.issubset(set(pg.columns)):
+        return {}
+
+    df = pg[list(needed)].copy()
+    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
+    df = df.sort_values(["TEAM_ID", "GAME_DATE"]).reset_index(drop=True)
+
+    poss = (df["FGA"] - df["OREB"] + df["TOV"] + 0.44 * df["FTA"]).clip(lower=1)
+    df["ortg"]   = df["PTS"] / poss * 100
+    df["drtg"]   = (df["PTS"] - df["PLUS_MINUS"]) / poss * 100
+    df["nrtg"]   = df["ortg"] - df["drtg"]
+    df["pace_g"] = poss * 240.0 / df["MIN"].clip(lower=1)  # per 48-min equiv
+
+    result = {}
+    for team_id, grp in df.groupby("TEAM_ID"):
+        grp = grp.sort_values("GAME_DATE").reset_index(drop=True)
+        for col in ["ortg", "drtg", "nrtg", "pace_g"]:
+            grp[f"pr_{col}"] = grp[col].shift(1).expanding().mean()
+
+        for idx, row in grp.iterrows():
+            if idx == 0 or pd.isna(row["pr_ortg"]):
+                continue
+            prior_count = int(idx)  # idx = number of games before this one
+            if prior_count < 4:
+                continue  # need at least a full series worth of data
+            result[(int(team_id), str(row["GAME_ID"]))] = {
+                "playoff_off_rtg":   float(row["pr_ortg"]),
+                "playoff_def_rtg":   float(row["pr_drtg"]),
+                "playoff_net_rtg":   float(row["pr_nrtg"]),
+                "playoff_pace":      float(row["pr_pace_g"]),
+                "prior_games_count": prior_count,
+            }
+    return result
+
+
 def _add_momentum_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Add two momentum features to a game-level DataFrame (one row per team per game):
@@ -121,6 +166,9 @@ def build_series_records(
         for _, row in pg.iterrows():
             pm_lookup[(int(row["TEAM_ID"]), str(row["GAME_ID"]))] = float(row.get("PLUS_MINUS", 0))
 
+    # Per-game playoff efficiency ratings (only populated for games with 4+ prior games)
+    playoff_stats_lookup = _compute_playoff_team_stats(pg)
+
     # Build per-game records
     game_records = {}
     for _, row in pg.iterrows():
@@ -166,24 +214,38 @@ def build_series_records(
                 series_wins = wins_a if focal_id == team_a else wins_b
                 series_losses = wins_b if focal_id == team_a else wins_a
 
+                po_focal = playoff_stats_lookup.get((focal_id, gid))
+                po_opp   = playoff_stats_lookup.get((opp_id,   gid))
+
                 all_rows.append({
-                    "season":          season,
-                    "game_date":       gdate,
-                    "team_id":         focal_id,
-                    "opponent_id":     opp_id,
-                    "game_id":         gid,
-                    "series_id":       series_id,
-                    "series_game_num": game_num,
-                    "home_court":      home_court,
-                    "won":             won,
-                    "rest_days":       rest,
-                    "opp_rest_days":   opp_rest,
-                    "rest_days_diff":  rest - opp_rest,
-                    "series_wins":     series_wins,
-                    "series_losses":   series_losses,
-                    "series_lead":     series_wins - series_losses,
-                    "is_bubble":       1 if season == BUBBLE_SEASON else 0,
-                    "plus_minus":      pm_lookup.get((focal_id, gid), 0.0),
+                    "season":              season,
+                    "game_date":           gdate,
+                    "team_id":             focal_id,
+                    "opponent_id":         opp_id,
+                    "game_id":             gid,
+                    "series_id":           series_id,
+                    "series_game_num":     game_num,
+                    "home_court":          home_court,
+                    "won":                 won,
+                    "rest_days":           rest,
+                    "opp_rest_days":       opp_rest,
+                    "rest_days_diff":      rest - opp_rest,
+                    "series_wins":         series_wins,
+                    "series_losses":       series_losses,
+                    "series_lead":         series_wins - series_losses,
+                    "is_bubble":           1 if season == BUBBLE_SEASON else 0,
+                    "plus_minus":          pm_lookup.get((focal_id, gid), 0.0),
+                    # Playoff efficiency ratings (None for R1 / fewer than 4 prior games)
+                    "playoff_off_rtg":     po_focal["playoff_off_rtg"] if po_focal else None,
+                    "playoff_def_rtg":     po_focal["playoff_def_rtg"] if po_focal else None,
+                    "playoff_net_rtg":     po_focal["playoff_net_rtg"] if po_focal else None,
+                    "playoff_pace":        po_focal["playoff_pace"]    if po_focal else None,
+                    "has_playoff_stats":   po_focal is not None,
+                    "opp_playoff_off_rtg": po_opp["playoff_off_rtg"]   if po_opp else None,
+                    "opp_playoff_def_rtg": po_opp["playoff_def_rtg"]   if po_opp else None,
+                    "opp_playoff_net_rtg": po_opp["playoff_net_rtg"]   if po_opp else None,
+                    "opp_playoff_pace":    po_opp["playoff_pace"]      if po_opp else None,
+                    "opp_has_playoff_stats": po_opp is not None,
                 })
 
             for t in game_records[gid]["teams"]:
@@ -304,6 +366,24 @@ def merge_team_stats_onto_games(
 
     df = games_df.merge(stats_focal, on="team_id",   how="left")
     df = df.merge(stats_opp,         on="opponent_id", how="left")
+
+    # Override reg season efficiency with playoff-computed stats for R2+ games
+    for reg_col, po_col in [
+        ("off_rtg", "playoff_off_rtg"), ("def_rtg", "playoff_def_rtg"),
+        ("net_rtg", "playoff_net_rtg"), ("pace",    "playoff_pace"),
+    ]:
+        if po_col in df.columns:
+            mask = df.get("has_playoff_stats", pd.Series(False, index=df.index)).fillna(False)
+            df.loc[mask, reg_col] = df.loc[mask, po_col]
+
+    for reg_col, po_col in [
+        ("opp_off_rtg", "opp_playoff_off_rtg"), ("opp_def_rtg", "opp_playoff_def_rtg"),
+        ("opp_net_rtg", "opp_playoff_net_rtg"), ("opp_pace",    "opp_playoff_pace"),
+    ]:
+        if po_col in df.columns:
+            mask = df.get("opp_has_playoff_stats", pd.Series(False, index=df.index)).fillna(False)
+            df.loc[mask, reg_col] = df.loc[mask, po_col]
+
     return _build_diff_features(df)
 
 
