@@ -20,7 +20,6 @@ output/
 
 # Node / React
 web/node_modules/
-web/dist/
 
 # OS
 .DS_Store
