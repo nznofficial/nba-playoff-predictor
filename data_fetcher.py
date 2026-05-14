@@ -111,7 +111,8 @@ def fetch_team_basic_stats(
         return df
 
     df = _retry_api_call(_call, base_sleep=sleep_sec)
-    cols = [c for c in ["TEAM_ID", "TEAM_NAME", "FG3A", "FGA"] if c in df.columns]
+    wanted = ["TEAM_ID", "TEAM_NAME", "FG3A", "FGA", "PTS", "FTA", "TOV", "OREB", "DREB"]
+    cols = [c for c in wanted if c in df.columns]
     df = df[cols]
     df.to_csv(cache_path, index=False)
     log.info(f"Cached basic stats: {cache_path}")
@@ -156,6 +157,50 @@ def fetch_game_log(
         df = pd.DataFrame(columns=["Game_ID", "GAME_DATE", "MATCHUP", "WL"])
     df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
     df.to_csv(cache_path, index=False)
+    return df
+
+
+def fetch_player_advanced_stats(
+    season: str,
+    season_type: str = "Regular Season",
+    cache_dir: str = "data/raw/player_stats",
+    sleep_sec: float = 1.0,
+) -> pd.DataFrame:
+    """
+    Fetch LeagueDashPlayerStats with MeasureType=Advanced for a given season/type.
+    Saves: PLAYER_ID, PLAYER_NAME, TEAM_ID, GP, MIN, NET_RATING, OFF_RATING, DEF_RATING.
+    Filters to players with GP >= 10 and MIN >= 10.
+    Caches to disk; loads from cache if present.
+    """
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    safe_type = season_type.replace(" ", "_")
+    cache_path = os.path.join(cache_dir, f"{season}_{safe_type}_player_advanced.csv")
+
+    if os.path.exists(cache_path):
+        return pd.read_csv(cache_path)
+
+    from nba_api.stats.endpoints import leaguedashplayerstats
+
+    def _call():
+        endpoint = leaguedashplayerstats.LeagueDashPlayerStats(
+            season=season,
+            season_type_all_star=season_type,
+            measure_type_detailed_defense="Advanced",
+            per_mode_detailed="PerGame",
+            timeout=60,
+        )
+        df = endpoint.get_data_frames()[0]
+        if len(df) < 50:
+            raise ValueError(f"Only {len(df)} player rows — likely empty response")
+        return df
+
+    df = _retry_api_call(_call, base_sleep=sleep_sec)
+    wanted = ["PLAYER_ID", "PLAYER_NAME", "TEAM_ID", "GP", "MIN", "NET_RATING", "OFF_RATING", "DEF_RATING"]
+    cols = [c for c in wanted if c in df.columns]
+    df = df[cols].copy()
+    df = df[(df["GP"] >= 10) & (df["MIN"] >= 10)].reset_index(drop=True)
+    df.to_csv(cache_path, index=False)
+    log.info(f"Cached player advanced stats: {cache_path}")
     return df
 
 
@@ -212,9 +257,7 @@ def fetch_all_seasons(
     team_ids = fetch_all_team_ids(season=seasons[-1], sleep_sec=sleep_sec)
     log.info(f"Found {len(team_ids)} teams")
 
-    # Step 2: fetch team stats for every season — REGULAR SEASON ONLY.
-    # Playoff team-level aggregate stats are not used as model features;
-    # only regular-season stats are joined onto each playoff game row.
+    # Step 2: fetch team stats and player stats for every season — REGULAR SEASON ONLY.
     for season in seasons:
         log.info(f"Fetching advanced stats: {season} Regular Season")
         try:
@@ -227,6 +270,12 @@ def fetch_all_seasons(
             fetch_team_basic_stats(season, "Regular Season", sleep_sec=sleep_sec)
         except Exception as e:
             log.error(f"Failed basic stats {season} Regular Season: {e}")
+
+        log.info(f"Fetching player advanced stats: {season} Regular Season")
+        try:
+            fetch_player_advanced_stats(season, "Regular Season", sleep_sec=sleep_sec)
+        except Exception as e:
+            log.error(f"Failed player stats {season} Regular Season: {e}")
 
     # Step 3: fetch game logs for each team, season, and season type
     # Also fetch PlayIn for rest-day lookback (2020-21 onward)

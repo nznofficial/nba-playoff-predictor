@@ -75,12 +75,14 @@ def main():
     # ── Step 1: Ensure team stats are cached (game logs not needed) ──────────
     log.info("\n[1/8] Loading team stats (cached)...")
     from data_fetcher import (
-        fetch_team_advanced_stats, fetch_team_basic_stats, fetch_all_team_ids, SEASONS
+        fetch_team_advanced_stats, fetch_team_basic_stats,
+        fetch_player_advanced_stats, fetch_all_team_ids, SEASONS
     )
     fetch_all_team_ids()
     for _season in SEASONS + [CURRENT_SEASON]:
         fetch_team_advanced_stats(_season, "Regular Season")
         fetch_team_basic_stats(_season, "Regular Season")
+        fetch_player_advanced_stats(_season, "Regular Season")
 
     # ── Step 2: Build training DataFrame ─────────────────────────────────────
     log.info("\n[2/8] Building training DataFrame...")

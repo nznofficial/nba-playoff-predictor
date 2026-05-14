@@ -15,6 +15,8 @@ data/raw/game_logs/
 data/cache/
 data/processed/
 
+# Do NOT ignore: data/raw/team_stats/, data/raw/player_stats/ (committed for Render)
+
 # Output / visualizations
 output/
 

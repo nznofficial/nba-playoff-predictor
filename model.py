@@ -12,13 +12,13 @@ import pandas as pd
 import joblib
 from pathlib import Path
 
-from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import (
     accuracy_score, roc_auc_score, classification_report
 )
+from xgboost import XGBClassifier
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +37,13 @@ MODEL_FEATURES = [
     "is_bubble",
     "series_pts_diff",
     "prior_playoff_pts_diff",
+    # New features
+    "ts_pct_diff",
+    "tov_rate_diff",
+    "ft_rate_diff",
+    "recent_win_pct_diff",
+    "h2h_win_pct",
+    "top3_net_rtg_diff",
 ]
 
 # Seasons used for temporal split
@@ -93,9 +100,19 @@ def train_model(
     y_test = test_df[target].astype(int)
 
     pipeline = Pipeline([
-        ("scaler", StandardScaler()),
-        ("logisticregression", LogisticRegression(
-            C=1.0, max_iter=1000, random_state=42, solver="lbfgs"
+        ("model", XGBClassifier(
+            n_estimators=80,
+            max_depth=2,
+            learning_rate=0.1,
+            subsample=0.6,
+            colsample_bytree=0.4,
+            min_child_weight=25,
+            gamma=0.5,
+            reg_alpha=2.0,
+            reg_lambda=10.0,
+            random_state=42,
+            eval_metric="logloss",
+            verbosity=0,
         )),
     ])
     pipeline.fit(X_train, y_train)
@@ -114,9 +131,8 @@ def train_model(
         "feature_names": features,
     }
 
-    # Extract coefficients
-    coef = pipeline.named_steps["logisticregression"].coef_[0]
-    metrics["feature_importances"] = dict(zip(features, coef.tolist()))
+    importances = pipeline.named_steps["model"].feature_importances_
+    metrics["feature_importances"] = dict(zip(features, importances.tolist()))
 
     joblib.dump(pipeline, model_path)
     log.info(f"Model saved to {model_path}")
@@ -154,9 +170,11 @@ def cross_validate_model(
         y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
 
         pipe = Pipeline([
-            ("scaler", StandardScaler()),
-            ("logisticregression", LogisticRegression(
-                C=1.0, max_iter=1000, random_state=42, solver="lbfgs"
+            ("model", XGBClassifier(
+                n_estimators=80, max_depth=2, learning_rate=0.1,
+                subsample=0.6, colsample_bytree=0.4, min_child_weight=25,
+                gamma=0.5, reg_alpha=2.0, reg_lambda=10.0,
+                random_state=42, eval_metric="logloss", verbosity=0,
             )),
         ])
         pipe.fit(X_tr, y_tr)
@@ -211,15 +229,14 @@ def print_model_report(model: Pipeline, metrics: dict, feature_names: list = Non
     print("Classification Report (Test Set):")
     print(metrics["classification_report"])
 
-    print("Feature Coefficients (positive = favors win):")
-    print(f"{'Feature':<25} {'Coefficient':>12}")
+    print("Feature Importances (XGBoost gain, higher = more predictive):")
+    print(f"{'Feature':<25} {'Importance':>12}")
     print("-" * 38)
-    coef_items = sorted(
+    imp_items = sorted(
         metrics["feature_importances"].items(),
-        key=lambda x: abs(x[1]),
+        key=lambda x: x[1],
         reverse=True
     )
-    for feat, coef in coef_items:
-        sign = "+" if coef >= 0 else ""
-        print(f"  {feat:<23} {sign}{coef:>10.4f}")
+    for feat, imp in imp_items:
+        print(f"  {feat:<23} {imp:>12.4f}")
     print("=" * 60 + "\n")

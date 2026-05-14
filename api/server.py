@@ -56,9 +56,30 @@ def _load_team_stats(season: str = CURRENT_SEASON) -> pd.DataFrame:
     adv  = pd.read_csv(DATA_DIR / "team_stats" / f"{season}_Regular_Season_advanced.csv")
     base = pd.read_csv(DATA_DIR / "team_stats" / f"{season}_Regular_Season_base.csv")
     base["three_pt_rate"] = base["FG3A"] / base["FGA"].replace(0, np.nan)
-    return adv.merge(base[["TEAM_ID", "three_pt_rate"]], on="TEAM_ID")
+    if all(c in base.columns for c in ["PTS", "FGA", "FTA", "TOV"]):
+        base["ts_pct"]   = base["PTS"] / (2 * (base["FGA"] + 0.44 * base["FTA"])).replace(0, np.nan)
+        base["tov_rate"] = base["TOV"] / (base["FGA"] + 0.44 * base["FTA"] + base["TOV"]).replace(0, np.nan)
+        base["ft_rate"]  = base["FTA"] / base["FGA"].replace(0, np.nan)
+    keep = [c for c in ["TEAM_ID", "three_pt_rate", "ts_pct", "tov_rate", "ft_rate"] if c in base.columns]
+    return adv.merge(base[keep], on="TEAM_ID")
 
 _team_stats = _load_team_stats()
+
+
+def _load_player_ratings_for_season(season: str = CURRENT_SEASON) -> dict:
+    """Returns {team_id: avg NET_RATING of top-3 players by minutes}."""
+    path = DATA_DIR / "player_stats" / f"{season}_Regular_Season_player_advanced.csv"
+    if not path.exists():
+        return {}
+    df = pd.read_csv(path)
+    result = {}
+    for team_id, grp in df.groupby("TEAM_ID"):
+        top3 = grp.nlargest(3, "MIN")["NET_RATING"].dropna()
+        if len(top3) > 0:
+            result[int(team_id)] = float(top3.mean())
+    return result
+
+_player_ratings = _load_player_ratings_for_season()
 
 # ── 2025-26 bracket (R1 results hardcoded; R2+ enriched from live data) ────────
 # Bracket halves (group field):
@@ -545,6 +566,12 @@ def predict_game(req: PredictRequest):
     net_b = po_rtg_b["net_rtg"] if po_rtg_b else g(sb, "NET_RATING")
     pac_b = po_rtg_b["pace"]    if po_rtg_b else g(sb, "PACE")
 
+    ts_a  = g(sa, "ts_pct",   0.57);  ts_b  = g(sb, "ts_pct",   0.57)
+    tov_a = g(sa, "tov_rate", 0.13);  tov_b = g(sb, "tov_rate", 0.13)
+    ft_a  = g(sa, "ft_rate",  0.26);  ft_b  = g(sb, "ft_rate",  0.26)
+    top3_a = _player_ratings.get(req.team_a_id, 0.0)
+    top3_b = _player_ratings.get(req.team_b_id, 0.0)
+
     features = {
         "net_rtg_diff":            net_a - net_b,
         "off_rtg_diff":            off_a - def_b,
@@ -552,7 +579,7 @@ def predict_game(req: PredictRequest):
         "pace_diff":               pac_a - pac_b,
         "rest_days_diff":          rest_days_diff,
         "home_court":              int(home_a),
-        "win_pct_diff":            g(sa, "W_PCT")        - g(sb, "W_PCT"),
+        "win_pct_diff":            g(sa, "W_PCT") - g(sb, "W_PCT"),
         "series_game_num":         game_num,
         "series_lead":             req.wins_a - req.wins_b,
         "three_pt_rate_diff":      g(sa, "three_pt_rate", .35) - g(sb, "three_pt_rate", .35),
@@ -560,6 +587,12 @@ def predict_game(req: PredictRequest):
         "is_bubble":               0,
         "series_pts_diff":         round(series_pm_a - series_pm_b, 2),
         "prior_playoff_pts_diff":  round(prior_pm_a  - prior_pm_b,  2),
+        "ts_pct_diff":             round(ts_a  - ts_b,  4),
+        "tov_rate_diff":           round(tov_a - tov_b, 4),
+        "ft_rate_diff":            round(ft_a  - ft_b,  4),
+        "recent_win_pct_diff":     round(g(sa, "W_PCT", 0.5) - g(sb, "W_PCT", 0.5), 4),
+        "h2h_win_pct":             0.5,
+        "top3_net_rtg_diff":       round(top3_a - top3_b, 4),
     }
 
     prob_a = float(_model.predict_proba(pd.DataFrame([features])[MODEL_FEATURES])[0, 1])

@@ -50,6 +50,68 @@ def _load_playoff_games(season: str, playoff_dir: str = None) -> pd.DataFrame:
     return df
 
 
+def _load_team_game_log(team_id: int, season: str, data_dir: str) -> pd.DataFrame:
+    """Load regular season game log CSV sorted oldest-first. Empty DF if not found."""
+    path = os.path.join(data_dir, "game_logs", f"{team_id}_{season}_Regular_Season.csv")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    df = pd.read_csv(path)
+    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
+    return df.sort_values("GAME_DATE")
+
+
+def _compute_team_efficiency_from_logs(
+    team_id: int, season: str, data_dir: str, n_recent: int = 15
+) -> dict:
+    """TS%, TOV_rate, FT_rate (full season) and recent win% (last n_recent games)."""
+    df = _load_team_game_log(team_id, season, data_dir)
+    defaults = {"ts_pct": 0.57, "tov_rate": 0.13, "ft_rate": 0.26, "recent_win_pct": 0.5}
+    if len(df) == 0 or not {"PTS", "FGA", "FTA", "TOV", "WL"}.issubset(df.columns):
+        return defaults
+    pts = df["PTS"].sum()
+    fga = df["FGA"].sum()
+    fta = df["FTA"].sum()
+    tov = df["TOV"].sum()
+    poss = max(fga + 0.44 * fta + tov, 1)
+    return {
+        "ts_pct":         float(pts / max(2 * (fga + 0.44 * fta), 1)),
+        "tov_rate":       float(tov / poss),
+        "ft_rate":        float(fta / max(fga, 1)),
+        "recent_win_pct": float((df.tail(n_recent)["WL"] == "W").mean()),
+    }
+
+
+def _compute_h2h_win_pct(
+    team_a_id: int, team_b_id: int, season: str, data_dir: str
+) -> float:
+    """team_a's regular-season win% vs team_b. Returns 0.5 if no H2H games found."""
+    df_a = _load_team_game_log(team_a_id, season, data_dir)
+    df_b = _load_team_game_log(team_b_id, season, data_dir)
+    if len(df_a) == 0 or len(df_b) == 0:
+        return 0.5
+    shared_gids = set(df_b["Game_ID"].astype(str))
+    h2h = df_a[df_a["Game_ID"].astype(str).isin(shared_gids)]
+    if len(h2h) == 0:
+        return 0.5
+    return float((h2h["WL"] == "W").mean())
+
+
+def _load_player_ratings(season: str, data_dir: str) -> dict:
+    """Returns {team_id: avg NET_RATING of top-3 players by minutes}."""
+    path = os.path.join(data_dir, "player_stats", f"{season}_Regular_Season_player_advanced.csv")
+    if not os.path.exists(path):
+        return {}
+    df = pd.read_csv(path)
+    if not {"TEAM_ID", "MIN", "NET_RATING"}.issubset(df.columns):
+        return {}
+    result = {}
+    for team_id, grp in df.groupby("TEAM_ID"):
+        top3 = grp.nlargest(3, "MIN")["NET_RATING"].dropna()
+        if len(top3) > 0:
+            result[int(team_id)] = float(top3.mean())
+    return result
+
+
 def _compute_playoff_team_stats(pg: pd.DataFrame) -> dict:
     """
     For each (team_id, game_id), compute avg playoff efficiency from all PRIOR games.
@@ -71,25 +133,29 @@ def _compute_playoff_team_stats(pg: pd.DataFrame) -> dict:
     df["ortg"]   = df["PTS"] / poss * 100
     df["drtg"]   = (df["PTS"] - df["PLUS_MINUS"]) / poss * 100
     df["nrtg"]   = df["ortg"] - df["drtg"]
-    df["pace_g"] = poss * 240.0 / df["MIN"].clip(lower=1)  # per 48-min equiv
+    df["pace_g"] = poss * 240.0 / df["MIN"].clip(lower=1)
+    df["ts_g"]   = df["PTS"] / (2 * (df["FGA"] + 0.44 * df["FTA"])).clip(lower=1)
+    df["tov_g"]  = df["TOV"] / (df["FGA"] + 0.44 * df["FTA"] + df["TOV"]).clip(lower=1)
 
     result = {}
     for team_id, grp in df.groupby("TEAM_ID"):
         grp = grp.sort_values("GAME_DATE").reset_index(drop=True)
-        for col in ["ortg", "drtg", "nrtg", "pace_g"]:
+        for col in ["ortg", "drtg", "nrtg", "pace_g", "ts_g", "tov_g"]:
             grp[f"pr_{col}"] = grp[col].shift(1).expanding().mean()
 
         for idx, row in grp.iterrows():
             if idx == 0 or pd.isna(row["pr_ortg"]):
                 continue
-            prior_count = int(idx)  # idx = number of games before this one
+            prior_count = int(idx)
             if prior_count < 4:
-                continue  # need at least a full series worth of data
+                continue
             result[(int(team_id), str(row["GAME_ID"]))] = {
                 "playoff_off_rtg":   float(row["pr_ortg"]),
                 "playoff_def_rtg":   float(row["pr_drtg"]),
                 "playoff_net_rtg":   float(row["pr_nrtg"]),
                 "playoff_pace":      float(row["pr_pace_g"]),
+                "playoff_ts_pct":    float(row["pr_ts_g"]),
+                "playoff_tov_rate":  float(row["pr_tov_g"]),
                 "prior_games_count": prior_count,
             }
     return result
@@ -236,15 +302,19 @@ def build_series_records(
                     "is_bubble":           1 if season == BUBBLE_SEASON else 0,
                     "plus_minus":          pm_lookup.get((focal_id, gid), 0.0),
                     # Playoff efficiency ratings (None for R1 / fewer than 4 prior games)
-                    "playoff_off_rtg":     po_focal["playoff_off_rtg"] if po_focal else None,
-                    "playoff_def_rtg":     po_focal["playoff_def_rtg"] if po_focal else None,
-                    "playoff_net_rtg":     po_focal["playoff_net_rtg"] if po_focal else None,
-                    "playoff_pace":        po_focal["playoff_pace"]    if po_focal else None,
+                    "playoff_off_rtg":     po_focal["playoff_off_rtg"]  if po_focal else None,
+                    "playoff_def_rtg":     po_focal["playoff_def_rtg"]  if po_focal else None,
+                    "playoff_net_rtg":     po_focal["playoff_net_rtg"]  if po_focal else None,
+                    "playoff_pace":        po_focal["playoff_pace"]     if po_focal else None,
+                    "playoff_ts_pct":      po_focal["playoff_ts_pct"]   if po_focal else None,
+                    "playoff_tov_rate":    po_focal["playoff_tov_rate"] if po_focal else None,
                     "has_playoff_stats":   po_focal is not None,
-                    "opp_playoff_off_rtg": po_opp["playoff_off_rtg"]   if po_opp else None,
-                    "opp_playoff_def_rtg": po_opp["playoff_def_rtg"]   if po_opp else None,
-                    "opp_playoff_net_rtg": po_opp["playoff_net_rtg"]   if po_opp else None,
-                    "opp_playoff_pace":    po_opp["playoff_pace"]      if po_opp else None,
+                    "opp_playoff_off_rtg": po_opp["playoff_off_rtg"]    if po_opp else None,
+                    "opp_playoff_def_rtg": po_opp["playoff_def_rtg"]    if po_opp else None,
+                    "opp_playoff_net_rtg": po_opp["playoff_net_rtg"]    if po_opp else None,
+                    "opp_playoff_pace":    po_opp["playoff_pace"]       if po_opp else None,
+                    "opp_playoff_ts_pct":  po_opp["playoff_ts_pct"]     if po_opp else None,
+                    "opp_playoff_tov_rate":po_opp["playoff_tov_rate"]   if po_opp else None,
                     "opp_has_playoff_stats": po_opp is not None,
                 })
 
@@ -300,8 +370,22 @@ def _load_reg_season_stats(season: str, data_dir: str) -> pd.DataFrame:
     else:
         base["three_pt_rate"] = 0.35
 
-    merged = adv.merge(base[["TEAM_ID", "three_pt_rate"]], on="TEAM_ID", how="left")
+    # Efficiency stats from expanded base stats (PTS, FGA, FTA, TOV per game)
+    if all(c in base.columns for c in ["PTS", "FGA", "FTA", "TOV"]):
+        base["ts_pct"]   = base["PTS"] / (2 * (base["FGA"] + 0.44 * base["FTA"])).replace(0, np.nan)
+        base["tov_rate"] = base["TOV"] / (base["FGA"] + 0.44 * base["FTA"] + base["TOV"]).replace(0, np.nan)
+        base["ft_rate"]  = base["FTA"] / base["FGA"].replace(0, np.nan)
+    else:
+        base["ts_pct"]   = 0.57
+        base["tov_rate"] = 0.13
+        base["ft_rate"]  = 0.26
+
+    keep = [c for c in ["TEAM_ID", "three_pt_rate", "ts_pct", "tov_rate", "ft_rate"] if c in base.columns]
+    merged = adv.merge(base[keep], on="TEAM_ID", how="left")
     merged["three_pt_rate"] = merged["three_pt_rate"].fillna(0.35)
+    merged["ts_pct"]        = merged["ts_pct"].fillna(0.57)
+    merged["tov_rate"]      = merged["tov_rate"].fillna(0.13)
+    merged["ft_rate"]       = merged["ft_rate"].fillna(0.26)
     return merged
 
 
@@ -314,13 +398,21 @@ def _build_diff_features(df: pd.DataFrame) -> pd.DataFrame:
         b = df[opp_col].fillna(default) if opp_col in df.columns else default
         return a - b
 
-    df["off_rtg_diff"]      = _diff("off_rtg",          "opp_def_rtg")
-    df["def_rtg_diff"]      = _diff("def_rtg",          "opp_off_rtg")
-    df["net_rtg_diff"]      = _diff("net_rtg",          "opp_net_rtg")
-    df["pace_diff"]         = _diff("pace",              "opp_pace")
-    df["win_pct_diff"]      = _diff("team_win_pct_reg",  "opp_team_win_pct_reg")
-    df["three_pt_rate_diff"]= _diff("three_pt_rate",     "opp_three_pt_rate", 0.35)
-    df["playoff_exp_diff"]  = _diff("playoff_exp_3yr",   "opp_playoff_exp_3yr")
+    df["off_rtg_diff"]        = _diff("off_rtg",           "opp_def_rtg")
+    df["def_rtg_diff"]        = _diff("def_rtg",           "opp_off_rtg")
+    df["net_rtg_diff"]        = _diff("net_rtg",           "opp_net_rtg")
+    df["pace_diff"]           = _diff("pace",               "opp_pace")
+    df["win_pct_diff"]        = _diff("team_win_pct_reg",   "opp_team_win_pct_reg")
+    df["three_pt_rate_diff"]  = _diff("three_pt_rate",      "opp_three_pt_rate",  0.35)
+    df["playoff_exp_diff"]    = _diff("playoff_exp_3yr",    "opp_playoff_exp_3yr")
+    df["ts_pct_diff"]         = _diff("ts_pct",             "opp_ts_pct",         0.57)
+    df["tov_rate_diff"]       = _diff("tov_rate",           "opp_tov_rate",       0.13)
+    df["ft_rate_diff"]        = _diff("ft_rate",            "opp_ft_rate",        0.26)
+    df["recent_win_pct_diff"] = _diff("recent_win_pct",     "opp_recent_win_pct", 0.5)
+    df["top3_net_rtg_diff"]   = _diff("top3_net_rtg",       "opp_top3_net_rtg",   0.0)
+    # h2h_win_pct is already directional (focal team's perspective) — no diff needed
+    if "h2h_win_pct" not in df.columns:
+        df["h2h_win_pct"] = 0.5
     return df
 
 
@@ -330,6 +422,7 @@ def merge_team_stats_onto_games(
     season: str,
     all_seasons: list,
     playoff_dir: str = None,
+    data_dir: str = "data/raw",
 ) -> pd.DataFrame:
     """Join regular-season stats onto each game row and compute differential features."""
     if len(games_df) == 0 or len(reg_season_stats) == 0:
@@ -356,6 +449,7 @@ def merge_team_stats_onto_games(
     stat_cols = [c for c in [
         "TEAM_ID", "off_rtg", "def_rtg", "net_rtg", "pace",
         "team_win_pct_reg", "three_pt_rate", "playoff_exp_3yr",
+        "ts_pct", "tov_rate", "ft_rate",
     ] if c in stats.columns]
 
     stats_focal = stats[stat_cols].rename(columns={"TEAM_ID": "team_id"})
@@ -369,20 +463,49 @@ def merge_team_stats_onto_games(
 
     # Override reg season efficiency with playoff-computed stats for R2+ games
     for reg_col, po_col in [
-        ("off_rtg", "playoff_off_rtg"), ("def_rtg", "playoff_def_rtg"),
-        ("net_rtg", "playoff_net_rtg"), ("pace",    "playoff_pace"),
+        ("off_rtg",  "playoff_off_rtg"),  ("def_rtg",  "playoff_def_rtg"),
+        ("net_rtg",  "playoff_net_rtg"),  ("pace",     "playoff_pace"),
+        ("ts_pct",   "playoff_ts_pct"),   ("tov_rate", "playoff_tov_rate"),
     ]:
         if po_col in df.columns:
             mask = df.get("has_playoff_stats", pd.Series(False, index=df.index)).fillna(False)
             df.loc[mask, reg_col] = df.loc[mask, po_col]
 
     for reg_col, po_col in [
-        ("opp_off_rtg", "opp_playoff_off_rtg"), ("opp_def_rtg", "opp_playoff_def_rtg"),
-        ("opp_net_rtg", "opp_playoff_net_rtg"), ("opp_pace",    "opp_playoff_pace"),
+        ("opp_off_rtg",  "opp_playoff_off_rtg"),  ("opp_def_rtg",  "opp_playoff_def_rtg"),
+        ("opp_net_rtg",  "opp_playoff_net_rtg"),  ("opp_pace",     "opp_playoff_pace"),
+        ("opp_ts_pct",   "opp_playoff_ts_pct"),   ("opp_tov_rate", "opp_playoff_tov_rate"),
     ]:
         if po_col in df.columns:
             mask = df.get("opp_has_playoff_stats", pd.Series(False, index=df.index)).fillna(False)
             df.loc[mask, reg_col] = df.loc[mask, po_col]
+
+    # ── Game-log-based features (recent form, H2H) ────────────────────────────
+    all_team_ids = list(pd.concat([df["team_id"], df["opponent_id"]]).unique())
+
+    eff_cache = {int(tid): _compute_team_efficiency_from_logs(int(tid), season, data_dir)
+                 for tid in all_team_ids}
+
+    def _eff(col, tid, default):
+        return eff_cache.get(int(tid), {}).get(col, default)
+
+    df["recent_win_pct"]     = df["team_id"].map(lambda x: _eff("recent_win_pct", x, 0.5))
+    df["opp_recent_win_pct"] = df["opponent_id"].map(lambda x: _eff("recent_win_pct", x, 0.5))
+
+    # Player star-power ratings
+    player_ratings = _load_player_ratings(season, data_dir)
+    df["top3_net_rtg"]     = df["team_id"].map(lambda x: player_ratings.get(int(x), 0.0))
+    df["opp_top3_net_rtg"] = df["opponent_id"].map(lambda x: player_ratings.get(int(x), 0.0))
+
+    # H2H win% (computed once per unique pair)
+    h2h_cache: dict = {}
+    def _h2h(focal_id, opp_id):
+        key = (int(focal_id), int(opp_id))
+        if key not in h2h_cache:
+            h2h_cache[key] = _compute_h2h_win_pct(int(focal_id), int(opp_id), season, data_dir)
+        return h2h_cache[key]
+
+    df["h2h_win_pct"] = [_h2h(r["team_id"], r["opponent_id"]) for _, r in df.iterrows()]
 
     return _build_diff_features(df)
 
@@ -417,7 +540,7 @@ def build_training_dataframe(
             log.warning(f"  No regular season stats for {season} — skipping")
             continue
 
-        enriched = merge_team_stats_onto_games(series_df, reg_stats, season, seasons, playoff_dir)
+        enriched = merge_team_stats_onto_games(series_df, reg_stats, season, seasons, playoff_dir, data_dir)
         if len(enriched) > 0:
             all_frames.append(enriched)
             log.info(f"  {season}: {len(enriched)} game-team rows")
@@ -526,6 +649,29 @@ def build_current_season_features(
 
     current_df = current_df.merge(stats_slim, on="team_id",   how="left")
     current_df = current_df.merge(stats_opp,  on="opponent_id", how="left")
+
+    # Game-log features for current season (recent form, H2H, player ratings)
+    all_team_ids = list(pd.concat([current_df["team_id"], current_df["opponent_id"]]).unique())
+    eff_cache = {int(tid): _compute_team_efficiency_from_logs(int(tid), season, data_dir)
+                 for tid in all_team_ids}
+    def _eff(col, tid, default):
+        return eff_cache.get(int(tid), {}).get(col, default)
+
+    current_df["recent_win_pct"]     = current_df["team_id"].map(lambda x: _eff("recent_win_pct", x, 0.5))
+    current_df["opp_recent_win_pct"] = current_df["opponent_id"].map(lambda x: _eff("recent_win_pct", x, 0.5))
+
+    player_ratings = _load_player_ratings(season, data_dir)
+    current_df["top3_net_rtg"]     = current_df["team_id"].map(lambda x: player_ratings.get(int(x), 0.0))
+    current_df["opp_top3_net_rtg"] = current_df["opponent_id"].map(lambda x: player_ratings.get(int(x), 0.0))
+
+    h2h_cache: dict = {}
+    def _h2h(focal_id, opp_id):
+        key = (int(focal_id), int(opp_id))
+        if key not in h2h_cache:
+            h2h_cache[key] = _compute_h2h_win_pct(int(focal_id), int(opp_id), season, data_dir)
+        return h2h_cache[key]
+    current_df["h2h_win_pct"] = [_h2h(r["team_id"], r["opponent_id"]) for _, r in current_df.iterrows()]
+
     current_df = _build_diff_features(current_df)
 
     current_df.to_csv(output_path, index=False)

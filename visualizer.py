@@ -388,31 +388,28 @@ def plot_feature_importance(
     output_path: str = "output/feature_importance.png",
 ) -> None:
     """
-    Horizontal bar chart of logistic regression coefficients.
-    Green = positive (favors win), Red = negative (hurts win prob).
+    Horizontal bar chart of XGBoost feature importances (gain).
     """
     Path(os.path.dirname(output_path)).mkdir(parents=True, exist_ok=True)
 
-    coef = model.named_steps["logisticregression"].coef_[0]
+    importances = model.named_steps["model"].feature_importances_
     coef_df = pd.DataFrame({
         "feature": feature_names,
-        "coefficient": coef,
+        "coefficient": importances,
     }).sort_values("coefficient")
 
-    colors = ["#e74c3c" if c < 0 else "#27ae60" for c in coef_df["coefficient"]]
+    colors = ["#27ae60" for _ in coef_df["coefficient"]]
 
     fig, ax = plt.subplots(figsize=(9, max(5, len(feature_names) * 0.5)))
     bars = ax.barh(coef_df["feature"], coef_df["coefficient"], color=colors, edgecolor="white")
-    ax.axvline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
-    ax.set_xlabel("Logistic Regression Coefficient", fontsize=11)
-    ax.set_title("Feature Importance\n(Positive = favors win, Negative = hurts win probability)",
+    ax.set_xlabel("XGBoost Feature Importance (Gain)", fontsize=11)
+    ax.set_title("Feature Importance\n(Higher = more predictive)",
                  fontsize=12, fontweight="bold", pad=10)
     ax.set_facecolor("#f8f9fa")
     fig.patch.set_facecolor("#f8f9fa")
 
-    green_patch = mpatches.Patch(color="#27ae60", label="Favors win")
-    red_patch = mpatches.Patch(color="#e74c3c", label="Hurts win prob")
-    ax.legend(handles=[green_patch, red_patch], loc="lower right")
+    ax.set_facecolor("#f8f9fa")
+    fig.patch.set_facecolor("#f8f9fa")
 
     plt.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
