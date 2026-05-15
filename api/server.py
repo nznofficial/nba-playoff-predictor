@@ -7,6 +7,7 @@ Run from the project root:
 
 import copy
 import json
+import os
 import sys
 import time
 import logging
@@ -16,7 +17,7 @@ from typing import Optional
 import joblib
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -80,6 +81,23 @@ def _load_player_ratings_for_season(season: str = CURRENT_SEASON) -> dict:
     return result
 
 _player_ratings = _load_player_ratings_for_season()
+
+
+def _load_player_ratings_by_name(season: str = CURRENT_SEASON) -> dict:
+    """Returns {player_name_lower: net_rating} for injury weighting."""
+    path = DATA_DIR / "player_stats" / f"{season}_Regular_Season_player_advanced.csv"
+    if not path.exists():
+        return {}
+    df = pd.read_csv(path)
+    if "NET_RATING" not in df.columns or "PLAYER_NAME" not in df.columns:
+        return {}
+    return {
+        str(row["PLAYER_NAME"]).lower().strip(): float(row["NET_RATING"])
+        for _, row in df.iterrows()
+        if not pd.isna(row["NET_RATING"])
+    }
+
+_player_ratings_by_name = _load_player_ratings_by_name()
 
 # ── 2025-26 bracket (R1 results hardcoded; R2+ enriched from live data) ────────
 # Bracket halves (group field):
@@ -348,10 +366,21 @@ def _compute_playoff_team_ratings(team_id: int) -> dict | None:
         return None
 
 
+def _injury_player_weight(display_name: str) -> float:
+    """Weight an injured player by their NET_RATING relative to league average.
+    Unknown players default to 1.0. Range clamped to [0.3, 3.0].
+    """
+    net_rtg = _player_ratings_by_name.get(display_name.lower().strip())
+    if net_rtg is None:
+        return 1.0
+    return float(np.clip(1.0 + net_rtg / 15.0, 0.3, 3.0))
+
+
 def _fetch_injury_burden(abbr: str) -> float:
     """
     Returns a [0, 1] injury burden for a team via the ESPN public injury API.
-    Higher = more key players out. Gracefully returns 0.0 on any failure.
+    Players are weighted by their NET_RATING so losing a star hurts more than
+    losing a bench player. Gracefully returns 0.0 on any failure.
     """
     if not abbr:
         return 0.0
@@ -367,18 +396,70 @@ def _fetch_injury_burden(abbr: str) -> float:
             if team_entry.get("team", {}).get("abbreviation", "").upper() == abbr.upper():
                 for item in team_entry.get("items", []):
                     status = item.get("status", "").lower()
+                    name   = item.get("athlete", {}).get("displayName", "")
+                    weight = _injury_player_weight(name)
                     if "out" in status:
-                        burden += 1.0
+                        burden += 1.0 * weight
                     elif "doubtful" in status:
-                        burden += 0.75
+                        burden += 0.75 * weight
                     elif "questionable" in status:
-                        burden += 0.25
+                        burden += 0.25 * weight
                 break
 
-        return min(burden / 5.0, 1.0)  # cap at 5-player equivalent
+        return min(burden / 5.0, 1.0)
     except Exception as e:
         log.warning(f"Injury fetch failed ({abbr}): {e}")
         return 0.0
+
+
+# ── Regular season game log cache (for recent form + h2h) ─────────────────────
+# Regular season is over during playoffs, so 24h TTL is sufficient.
+
+_game_log_cache: dict[int, tuple] = {}  # team_id → (df, timestamp)
+_GAME_LOG_TTL = 86400  # 24 hours
+
+
+def _fetch_team_season_log(team_id: int) -> pd.DataFrame:
+    """Fetch current regular season game log for a team. Cached in-memory for 24h."""
+    cached = _game_log_cache.get(team_id)
+    if cached and (time.time() - cached[1]) < _GAME_LOG_TTL:
+        return cached[0]
+    try:
+        from nba_api.stats.endpoints import teamgamelog
+        time.sleep(0.6)
+        df = teamgamelog.TeamGameLog(
+            team_id=team_id,
+            season=CURRENT_SEASON,
+            season_type_all_star="Regular Season",
+            timeout=15,
+        ).get_data_frames()[0]
+        _game_log_cache[team_id] = (df, time.time())
+        return df
+    except Exception as e:
+        log.warning(f"Game log fetch failed (team {team_id}): {e}")
+        return pd.DataFrame()
+
+
+def _recent_win_pct(team_id: int, n: int = 10) -> float:
+    """Win% of last n regular season games. Returns 0.5 on failure."""
+    df = _fetch_team_season_log(team_id)
+    if len(df) == 0 or "WL" not in df.columns:
+        return 0.5
+    return float((df.head(n)["WL"] == "W").mean())
+
+
+def _h2h_win_pct(team_a_id: int, team_b_id: int) -> float:
+    """Team A's win% vs Team B in the current regular season. Returns 0.5 if no games."""
+    abbr_b = _TEAM_ABBR.get(team_b_id, "")
+    if not abbr_b:
+        return 0.5
+    df = _fetch_team_season_log(team_a_id)
+    if len(df) == 0 or "MATCHUP" not in df.columns:
+        return 0.5
+    h2h = df[df["MATCHUP"].str.contains(abbr_b, na=False)]
+    if len(h2h) == 0:
+        return 0.5
+    return float((h2h["WL"] == "W").mean())
 
 
 def _live_key(id_a: int, id_b: int) -> str:
@@ -468,10 +549,14 @@ def _build_bracket() -> dict:
 # ── FastAPI app ────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="NBA Playoff Predictor")
+
+_raw_origins = os.environ.get("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000")
+_ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -481,8 +566,12 @@ def get_bracket():
     return _build_bracket()
 
 
+_REFRESH_SECRET = os.environ.get("REFRESH_SECRET", "")
+
 @app.post("/api/refresh")
-def refresh_bracket():
+def refresh_bracket(x_refresh_token: Optional[str] = Header(default=None)):
+    if _REFRESH_SECRET and x_refresh_token != _REFRESH_SECRET:
+        raise HTTPException(403, "Invalid or missing X-Refresh-Token header")
     if CACHE_FILE.exists():
         CACHE_FILE.unlink()
     return _build_bracket()
@@ -590,8 +679,8 @@ def predict_game(req: PredictRequest):
         "ts_pct_diff":             round(ts_a  - ts_b,  4),
         "tov_rate_diff":           round(tov_a - tov_b, 4),
         "ft_rate_diff":            round(ft_a  - ft_b,  4),
-        "recent_win_pct_diff":     round(g(sa, "W_PCT", 0.5) - g(sb, "W_PCT", 0.5), 4),
-        "h2h_win_pct":             0.5,
+        "recent_win_pct_diff":     round(_recent_win_pct(req.team_a_id) - _recent_win_pct(req.team_b_id), 4),
+        "h2h_win_pct":             round(_h2h_win_pct(req.team_a_id, req.team_b_id), 4),
         "top3_net_rtg_diff":       round(top3_a - top3_b, 4),
     }
 
@@ -629,9 +718,11 @@ if STATIC_DIR.exists():
     if _assets.exists():
         app.mount("/assets", StaticFiles(directory=str(_assets)), name="assets")
 
+    _STATIC_ROOT = STATIC_DIR.resolve()
+
     @app.get("/{full_path:path}", include_in_schema=False)
     async def spa_fallback(full_path: str):
-        candidate = STATIC_DIR / full_path
-        if candidate.is_file():
+        candidate = (STATIC_DIR / full_path).resolve()
+        if candidate.is_file() and candidate.is_relative_to(_STATIC_ROOT):
             return FileResponse(str(candidate))
         return FileResponse(str(STATIC_DIR / "index.html"))
