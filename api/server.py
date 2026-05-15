@@ -440,7 +440,7 @@ def _fetch_team_season_log(team_id: int) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def _recent_win_pct(team_id: int, n: int = 10) -> float:
+def _recent_win_pct(team_id: int, n: int = 15) -> float:
     """Win% of last n regular season games. Returns 0.5 on failure."""
     df = _fetch_team_season_log(team_id)
     if len(df) == 0 or "WL" not in df.columns:
