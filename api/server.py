@@ -11,6 +11,7 @@ import os
 import sys
 import time
 import logging
+import concurrent.futures
 from pathlib import Path
 from typing import Optional
 
@@ -199,14 +200,20 @@ def _fetch_live_series_scores() -> dict:
         if time.time() - cached.get("timestamp", 0) < CACHE_TTL:
             return _parse_series_scores(pd.DataFrame(cached["games"]))
 
-    try:
+    def _call_nba_api():
         from nba_api.stats.endpoints import leaguegamefinder
         time.sleep(0.6)
-        df = leaguegamefinder.LeagueGameFinder(
+        return leaguegamefinder.LeagueGameFinder(
             season_nullable=CURRENT_SEASON,
             season_type_nullable="Playoffs",
             timeout=30,
         ).get_data_frames()[0]
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            future = ex.submit(_call_nba_api)
+            df = future.result(timeout=40)
+
         if len(df) == 0:
             raise ValueError("Empty response")
 

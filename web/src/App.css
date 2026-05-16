@@ -380,6 +380,28 @@ body { min-height: 100vh; }
   line-height: 1.8;
 }
 .state-message.error { color: var(--red); }
+
+.refresh-error-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: rgba(255, 80, 80, 0.12);
+  border: 1px solid rgba(255, 80, 80, 0.35);
+  color: #ff8a8a;
+  font-size: 13px;
+  padding: 10px 20px;
+}
+.refresh-error-dismiss {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 14px;
+  opacity: 0.7;
+  flex-shrink: 0;
+}
+.refresh-error-dismiss:hover { opacity: 1; }
 .state-message code {
   background: var(--surface2);
   padding: 4px 10px;

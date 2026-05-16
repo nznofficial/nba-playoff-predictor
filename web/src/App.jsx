@@ -10,19 +10,30 @@ export default function App() {
   const [bracket, setBracket] = useState(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
+  const [refreshError, setRefreshError] = useState(null)
   const [prediction, setPrediction] = useState(null)
   const [predicting, setPredicting] = useState(false)
 
   const fetchBracket = useCallback(async (forceRefresh = false) => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 45_000)
     try {
       const url = forceRefresh ? `${API}/api/refresh` : `${API}/api/bracket`
       const method = forceRefresh ? 'POST' : 'GET'
-      const res = await fetch(url, { method })
+      const res = await fetch(url, { method, signal: controller.signal })
+      if (!res.ok) throw new Error(`Server error ${res.status}`)
       const data = await res.json()
       setBracket(data)
+      if (forceRefresh) setRefreshError(null)
     } catch (err) {
+      if (err.name === 'AbortError') {
+        setRefreshError('Live Scores timed out — NBA API was too slow. Try again in a moment.')
+      } else if (forceRefresh) {
+        setRefreshError('Refresh failed. Check that the API server is running.')
+      }
       console.error('Failed to load bracket:', err)
     } finally {
+      clearTimeout(timer)
       setLoading(false)
       setRefreshing(false)
     }
@@ -32,6 +43,7 @@ export default function App() {
 
   const handleRefresh = () => {
     setRefreshing(true)
+    setRefreshError(null)
     fetchBracket(true)
   }
 
@@ -79,6 +91,13 @@ export default function App() {
           {refreshing ? 'Refreshing…' : 'Live Scores'}
         </button>
       </header>
+
+      {refreshError && (
+        <div className="refresh-error-banner">
+          {refreshError}
+          <button className="refresh-error-dismiss" onClick={() => setRefreshError(null)}>✕</button>
+        </div>
+      )}
 
       <main className="bracket-root">
         {loading ? (
